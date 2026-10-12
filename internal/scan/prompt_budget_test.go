@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/config/template"
+	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/session"
 )
 
@@ -21,9 +22,15 @@ func TestRun_PromptOverflowRecordsFailure(t *testing.T) {
 		systemWords   int
 		content       string
 		withSmallFile bool
+		reuseSmall    bool
+		withFinding   bool
+		batchSize     int
 	}{
 		{name: "all files overflow", systemWords: 100, content: "package main\n"},
 		{name: "one file completes", systemWords: 20, content: "package main\n// " + strings.Repeat("test", 70) + "\n", withSmallFile: true},
+		{name: "one file reused with finding", systemWords: 100, content: "package main\n", withSmallFile: true, reuseSmall: true, withFinding: true},
+		{name: "one file reused without findings", systemWords: 100, content: "package main\n", withSmallFile: true, reuseSmall: true},
+		{name: "reused finding in later batch", systemWords: 100, content: "package main\n", withSmallFile: true, reuseSmall: true, withFinding: true, batchSize: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initTestRepo(t)
@@ -34,11 +41,31 @@ func TestRun_PromptOverflowRecordsFailure(t *testing.T) {
 			gitCommit(t, repo, "init")
 			tpl := budgetTestTemplate()
 			tpl.MaxTokens = 100
+			if tc.batchSize > 0 {
+				tpl.BatchStrategy = string(BatchByLanguage)
+				tpl.BatchSize = tc.batchSize
+			}
 			tpl.MainTask.Messages = []template.ChatMessage{
 				{Role: "system", Content: strings.Repeat("review ", tc.systemWords)},
 				{Role: "user", Content: "review {{file_content}}"},
 			}
 			client := &fakeBudgetClient{}
+			var resume *session.ResumeState
+			if tc.reuseSmall {
+				item := model.ScanItem{Path: "small.go", Content: "package main\n", LineCount: 1}
+				fingerprint := scanItemFingerprint(item)
+				var comments []model.LlmComment
+				if tc.withFinding {
+					comments = []model.LlmComment{{Path: item.Path, Content: "saved finding", StartLine: 1, EndLine: 1}}
+				}
+				resume = &session.ResumeState{
+					SessionID: "previous-scan",
+					Items: map[string]session.ResumeItem{fingerprint: {
+						FilePath: item.Path, OldPath: item.Path, NewPath: item.Path,
+						Fingerprint: fingerprint, Comments: comments,
+					}},
+				}
+			}
 			a := NewAgent(Args{
 				RepoDir:        repo,
 				Template:       tpl,
@@ -47,12 +74,17 @@ func TestRun_PromptOverflowRecordsFailure(t *testing.T) {
 				SkipPlan:       true,
 				SkipDedup:      true,
 				SkipSummary:    true,
+				Resume:         resume,
 				Session:        session.New(repo, "main", "test", session.SessionOptions{ReviewMode: session.ReviewModeFullScan}),
 			})
-			_, err := a.Run(context.Background())
+			comments, err := a.Run(context.Background())
 			wantCalls := int64(0)
+			wantItems := 0
 			if tc.withSmallFile {
-				wantCalls = 1
+				wantItems = 1
+				if !tc.reuseSmall {
+					wantCalls = 1
+				}
 				if err != nil {
 					t.Fatalf("mixed scan: %v", err)
 				}
@@ -61,6 +93,12 @@ func TestRun_PromptOverflowRecordsFailure(t *testing.T) {
 			}
 			if calls := atomic.LoadInt64(&client.calls); calls != wantCalls {
 				t.Fatalf("MAIN_TASK calls = %d, want %d", calls, wantCalls)
+			}
+			if tc.withFinding && (len(comments) != 1 || comments[0].Content != "saved finding" || comments[0].Path != "small.go") {
+				t.Fatalf("reused finding lost: %+v", comments)
+			}
+			if !tc.withFinding && len(comments) != 0 {
+				t.Fatalf("unexpected findings: %+v", comments)
 			}
 			var foundWarning bool
 			for _, warning := range a.Warnings() {
@@ -75,12 +113,15 @@ func TestRun_PromptOverflowRecordsFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(state.Items) != int(wantCalls) {
-				t.Fatalf("reusable items = %d, want %d", len(state.Items), wantCalls)
+			if len(state.Items) != wantItems {
+				t.Fatalf("reusable items = %d, want %d", len(state.Items), wantItems)
 			}
 			for _, item := range state.Items {
 				if item.FilePath != "small.go" {
 					t.Errorf("incomplete file was marked reusable: %s", item.FilePath)
+				}
+				if tc.withFinding && (len(item.Comments) != 1 || item.Comments[0].Content != "saved finding") {
+					t.Fatalf("reused checkpoint lost finding: %+v", item)
 				}
 			}
 			path, err := session.SessionFilePath(repo, a.SessionID())
