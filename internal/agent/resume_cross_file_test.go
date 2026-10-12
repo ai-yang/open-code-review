@@ -10,12 +10,49 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/tool"
 )
+
+func TestReviewPersistsCheckpointWhileNextGroupIsRunning(t *testing.T) {
+	diffs := []model.Diff{
+		{OldPath: "a.go", NewPath: "a.go", Diff: "+done()", Insertions: 1},
+		{OldPath: "blocked.go", NewPath: "blocked.go", Diff: "+pending()", Insertions: 1},
+	}
+	client := &cancellationFlowClient{blocked: make(chan struct{})}
+	parent := newManifestFlowAgentWithClient(t, diffs, nil, client)
+	parent.args.MaxConcurrency = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	done := make(chan error, 1)
+	go func() {
+		_, err := parent.dispatchSubtasks(ctx)
+		done <- err
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case <-client.blocked:
+	case <-ctx.Done():
+		t.Fatal("second group never started")
+	}
+	state, err := session.LoadReviewResumeState(parent.args.RepoDir, parent.SessionID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := reviewItemFingerprint(parent.reviewMode(), diffs[0])
+	if _, ok := state.Item(fingerprint); !ok {
+		t.Fatal("completed group has no durable checkpoint while the next group is running")
+	}
+	if state.Manifest != nil {
+		t.Fatal("test must inspect the checkpoint before finalization")
+	}
+}
 
 func TestAuditResumePreservesCrossFileFinding(t *testing.T) {
 	diffs := []model.Diff{
@@ -137,6 +174,16 @@ func TestFinalReviewCheckpointsPreserveCoverage(t *testing.T) {
 			}
 			if len(comments) != wantComments || comments[len(comments)-1].Path != "a.go" {
 				t.Fatalf("parent comments = %+v", comments)
+			}
+			incremental, err := session.LoadReviewResumeState(parent.args.RepoDir, parent.SessionID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, saved := incremental.Item(fingerprint); saved == tc.failTarget {
+				t.Fatalf("incremental target checkpoint saved=%v, failed=%v", saved, tc.failTarget)
+			}
+			if _, reusable := incremental.ReusableItem(fingerprint); reusable {
+				t.Fatal("incremental checkpoint bypassed the final manifest requirement")
 			}
 			manifest := finishManifestFlow(t, parent)
 			state, err := session.LoadReviewResumeState(parent.args.RepoDir, parent.SessionID())

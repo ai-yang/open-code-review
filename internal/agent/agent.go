@@ -789,6 +789,7 @@ dispatchLoop:
 						fingerprint := reviewItemFingerprint(a.reviewMode(), d)
 						if comments := a.args.CommentCollector.CommentsForPath(d.NewPath); len(comments) > 0 {
 							a.markCompleted(d)
+							a.recordReviewCheckpoint(d, false)
 							continue
 						}
 						a.markFailed(d, stop.class, stop.reason)
@@ -815,6 +816,7 @@ dispatchLoop:
 			}
 			for _, d := range g.Diffs {
 				a.markCompleted(d)
+				a.recordReviewCheckpoint(d, false)
 			}
 		}(group)
 	}
@@ -896,6 +898,7 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 			a.args.CommentCollector.Add(cm)
 		}
 		a.markReused(d)
+		a.recordReviewCheckpoint(d, true)
 		reused++
 	}
 
@@ -1294,21 +1297,25 @@ func (a *Agent) persistFinalReviewCheckpoints(m *session.RunManifest) {
 	for _, item := range m.Coverage.Reused {
 		reused[item.ItemID] = true
 	}
-	// Another group can add or relocate findings after this file finishes.
-	// Write successful checkpoints once all comment workers and filters have
-	// finished, preserving the manifest's completed/reused verdict.
+	// Final snapshots replace incremental ones after cross-file findings and
+	// filters settle, without promoting failed items to reusable checkpoints.
 	for _, d := range a.diffs {
 		id := a.manifestItemID(d)
 		if !completed[id] && !reused[id] {
 			continue
 		}
-		fingerprint := reviewItemFingerprint(a.reviewMode(), d)
-		comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
-		if reused[id] {
-			a.session.RecordReviewItemReused(effectivePath(d), d.OldPath, d.NewPath, fingerprint, resumedFromSession(a.args.Resume), comments)
-		} else {
-			a.session.RecordReviewItemDone(effectivePath(d), d.OldPath, d.NewPath, fingerprint, comments)
-		}
+		a.recordReviewCheckpoint(d, reused[id])
+	}
+}
+
+func (a *Agent) recordReviewCheckpoint(d model.Diff, reused bool) {
+	path := effectivePath(d)
+	fingerprint := reviewItemFingerprint(a.reviewMode(), d)
+	comments := a.args.CommentCollector.CommentsForPath(path)
+	if reused {
+		a.session.RecordReviewItemReused(path, d.OldPath, d.NewPath, fingerprint, resumedFromSession(a.args.Resume), comments)
+	} else {
+		a.session.RecordReviewItemDone(path, d.OldPath, d.NewPath, fingerprint, comments)
 	}
 }
 
